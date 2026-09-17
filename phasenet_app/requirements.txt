@@ -6,3 +6,4 @@ numpy>=1.26
 scipy>=1.11
 aiohttp>=3.9
 matplotlib>=3.8
+numba>=0.59

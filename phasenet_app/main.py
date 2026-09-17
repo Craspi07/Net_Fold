@@ -7,11 +7,13 @@ prediction, spatial/kinetic modeling, and information-theoretic analysis.
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import sys
 
 from PyQt6.QtWidgets import QApplication
 
 from ui.main_window import DARK_STYLESHEET, MainWindow
+from utils.parallel_worker import shutdown_executor
 
 
 def configure_logging() -> None:
@@ -27,6 +29,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("PhaseNet-Sim")
     app.setStyleSheet(DARK_STYLESHEET)
+    app.aboutToQuit.connect(shutdown_executor)
 
     window = MainWindow()
     window.show()
@@ -34,4 +37,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Required for ProcessPoolExecutor portability under the "spawn" start
+    # method (macOS/Windows default): child processes re-import this module,
+    # so all pool submission must stay behind this guard.
+    multiprocessing.freeze_support()
     sys.exit(main())

@@ -4,16 +4,24 @@ Quantifies informational throughput of the network (mutual information
 between an input and output node's trajectories), noise-buffering
 (Fano factor / SNR), and temporal delay/gain, comparing simulations with
 LLPS condensate kinetics enabled vs. disabled.
+
+The LLPS-on/off comparison, the MI-vs-noise sweep, and the multi-realization
+Monte Carlo average each require multiple independent simulations; all
+three fan out across the shared ``ProcessPoolExecutor`` (via
+``utils.parallel_worker.run_parallel``) instead of running sequentially or
+on a QThread, since QThread cannot free CPU-bound SciPy integration from
+the GIL.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, List, Optional
 
 import numpy as np
 
-from core.layer3_kinetics import KineticsSimulator, SimulationResult
+from core.layer3_kinetics import SimulationResult, simulate_task
+from utils.parallel_worker import ProgressCB, run_parallel
 
 log = logging.getLogger("phasenet.layer4")
 
@@ -92,18 +100,23 @@ def compute_information_metrics(result: SimulationResult, input_node: str, outpu
     )
 
 
-def compare_llps_effect(simulator: KineticsSimulator, input_nodes, output_nodes,
-                          signal_kind: str = "step", amplitude: float = 1.0,
-                          bins: int = 16) -> Dict[str, Dict]:
-    """Run with and without LLPS kinetics and compare information metrics."""
-    result_on = simulator.simulate(input_nodes, output_nodes, signal_kind=signal_kind,
-                                    amplitude=amplitude, llps_enabled=True)
-    result_off = simulator.simulate(input_nodes, output_nodes, signal_kind=signal_kind,
-                                     amplitude=amplitude, llps_enabled=False)
+def compare_llps_effect(G, input_nodes: List[str], output_nodes: List[str],
+                          gamma: float = 2.0, kpart_threshold: float = 0.5, sim_time: float = 50.0,
+                          noise_amplitude: float = 0.1, signal_kind: str = "step", amplitude: float = 1.0,
+                          bins: int = 16, progress_cb: ProgressCB = None,
+                          max_workers: Optional[int] = None) -> Dict[str, Dict]:
+    """Run with and without LLPS kinetics (in parallel) and compare information metrics."""
+    common = dict(gamma=gamma, kpart_threshold=kpart_threshold, sim_time=sim_time,
+                  noise_amplitude=noise_amplitude, signal_kind=signal_kind, amplitude=amplitude)
+    tasks = [
+        ((G, input_nodes, output_nodes), {**common, "llps_enabled": True, "seed": 0}),
+        ((G, input_nodes, output_nodes), {**common, "llps_enabled": False, "seed": 0}),
+    ]
+    result_on, result_off = run_parallel(simulate_task, tasks, progress_cb=progress_cb,
+                                          max_workers=max_workers, label="LLPS comparison")
 
     out_node = output_nodes[0]
     in_node = input_nodes[0]
-
     metrics_on = compute_information_metrics(result_on, in_node, out_node, bins=bins)
     metrics_off = compute_information_metrics(result_off, in_node, out_node, bins=bins)
 
@@ -115,14 +128,58 @@ def compare_llps_effect(simulator: KineticsSimulator, input_nodes, output_nodes,
     }
 
 
-def mi_vs_noise_curve(simulator: KineticsSimulator, input_nodes, output_nodes,
-                        noise_levels, bins: int = 16) -> Dict[str, np.ndarray]:
-    """Sweep noise amplitude and record I(X;Y) for the Panel B workbench plot."""
-    mi_values = []
-    for noise in noise_levels:
-        simulator.noise_amplitude = noise
-        result = simulator.simulate(input_nodes, output_nodes, signal_kind="gaussian",
-                                     amplitude=1.0, llps_enabled=True)
-        metrics = compute_information_metrics(result, input_nodes[0], output_nodes[0], bins=bins)
-        mi_values.append(metrics.mutual_information)
+def mi_vs_noise_curve(G, input_nodes: List[str], output_nodes: List[str], noise_levels,
+                        gamma: float = 2.0, kpart_threshold: float = 0.5, sim_time: float = 50.0,
+                        bins: int = 16, progress_cb: ProgressCB = None,
+                        max_workers: Optional[int] = None) -> Dict[str, np.ndarray]:
+    """Sweep noise amplitude (in parallel, one process per level) for the Panel B plot."""
+    tasks = [
+        ((G, input_nodes, output_nodes), dict(gamma=gamma, kpart_threshold=kpart_threshold,
+         sim_time=sim_time, noise_amplitude=float(level), signal_kind="gaussian", amplitude=1.0,
+         llps_enabled=True, seed=i))
+        for i, level in enumerate(noise_levels)
+    ]
+    results = run_parallel(simulate_task, tasks, progress_cb=progress_cb,
+                            max_workers=max_workers, label="noise level")
+
+    mi_values = [
+        compute_information_metrics(r, input_nodes[0], output_nodes[0], bins=bins).mutual_information
+        if r is not None else 0.0
+        for r in results
+    ]
     return {"noise_levels": np.array(noise_levels), "mutual_information": np.array(mi_values)}
+
+
+def parallel_mi_realizations(G, input_nodes: List[str], output_nodes: List[str],
+                               gamma: float = 2.0, kpart_threshold: float = 0.5, sim_time: float = 50.0,
+                               noise_amplitude: float = 0.2, n_realizations: int = 8,
+                               signal_kind: str = "gaussian", amplitude: float = 1.0,
+                               llps_enabled: bool = True, bins: int = 16,
+                               progress_cb: ProgressCB = None, max_workers: Optional[int] = None) -> Dict:
+    """Pool multiple independent stochastic noise realizations into one MI/Fano estimate.
+
+    Each realization is a full simulation with its own RNG seed, run as a
+    separate process-pool task; pooling their trajectories before computing
+    mutual information reduces single-run estimator variance.
+    """
+    tasks = [
+        ((G, input_nodes, output_nodes), dict(gamma=gamma, kpart_threshold=kpart_threshold,
+         sim_time=sim_time, noise_amplitude=noise_amplitude, signal_kind=signal_kind,
+         amplitude=amplitude, llps_enabled=llps_enabled, seed=seed))
+        for seed in range(n_realizations)
+    ]
+    results: List[SimulationResult] = run_parallel(simulate_task, tasks, progress_cb=progress_cb,
+                                                     max_workers=max_workers, label="realization")
+    results = [r for r in results if r is not None]
+    if not results:
+        return {"mutual_information": 0.0, "fano_factor": 0.0, "n_realizations": 0, "realizations": []}
+
+    all_x = np.concatenate([r.trajectories[input_nodes[0]] for r in results])
+    all_y = np.concatenate([r.trajectories[output_nodes[0]] for r in results])
+
+    return {
+        "mutual_information": mutual_information(all_x, all_y, bins=bins),
+        "fano_factor": float(np.mean([fano_factor(r.trajectories[output_nodes[0]]) for r in results])),
+        "n_realizations": len(results),
+        "realizations": results,
+    }

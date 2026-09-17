@@ -1,23 +1,27 @@
 """Layer 5: In-Silico Mutagenesis & Sensitivity Dashboard.
 
 Systematic node knockouts and valency (S_LLPS-lowering) mutagenesis to
-observe information decay, plus a Sobol/Latin-Hypercube sensitivity
-matrix over (K_part threshold, gamma).
+observe information decay, plus a Latin-Hypercube sensitivity matrix over
+(K_part threshold, gamma). Every node/sample in these scans requires its
+own full kinetic simulation + MI calculation, so each is dispatched as an
+independent task to the shared ``ProcessPoolExecutor`` via
+``utils.parallel_worker.run_parallel`` - these scans are embarrassingly
+parallel and would otherwise dominate runtime if run sequentially.
 """
 from __future__ import annotations
 
 import logging
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
 import numpy as np
 from scipy.stats import qmc
 
-from core.layer3_kinetics import KineticsSimulator
+from core.layer3_kinetics import simulate_task
 from core.layer4_infotheory import compute_information_metrics
+from utils.parallel_worker import ProgressCB, run_parallel
 
 log = logging.getLogger("phasenet.layer5")
-ProgressCB = Optional[Callable[[int, str], None]]
 
 
 def knockout_node(G: nx.Graph, node: str) -> nx.Graph:
@@ -27,89 +31,91 @@ def knockout_node(G: nx.Graph, node: str) -> nx.Graph:
     return H
 
 
+def _mi_from_simulation(G: nx.Graph, input_nodes: List[str], output_nodes: List[str],
+                          gamma: float, kpart_threshold: float, sim_time: float) -> float:
+    """Run one simulation and return I(X;Y); used as a single process-pool task unit."""
+    if input_nodes[0] not in G or output_nodes[0] not in G or not nx.has_path(G, input_nodes[0], output_nodes[0]):
+        return 0.0
+    result = simulate_task(G, input_nodes, output_nodes, gamma=gamma, kpart_threshold=kpart_threshold,
+                            sim_time=sim_time, llps_enabled=True, seed=0)
+    return compute_information_metrics(result, input_nodes[0], output_nodes[0]).mutual_information
+
+
 def deletion_scan(G: nx.Graph, input_nodes: List[str], output_nodes: List[str],
                    gamma: float = 2.0, kpart_threshold: float = 0.5, sim_time: float = 50.0,
-                   progress_cb: ProgressCB = None) -> Dict[str, float]:
-    """Knock out each non-input/output node and record I(X;Y) drop."""
-    baseline_sim = KineticsSimulator(G, gamma=gamma, kpart_threshold=kpart_threshold, sim_time=sim_time)
-    baseline_result = baseline_sim.simulate(input_nodes, output_nodes, llps_enabled=True)
-    baseline_mi = compute_information_metrics(baseline_result, input_nodes[0], output_nodes[0]).mutual_information
+                   progress_cb: ProgressCB = None, max_workers: Optional[int] = None) -> Dict[str, float]:
+    """Knock out each non-input/output node (in parallel) and record I(X;Y) drop."""
+    baseline_mi = _mi_from_simulation(G, input_nodes, output_nodes, gamma, kpart_threshold, sim_time)
 
     candidates = [n for n in G.nodes() if n not in input_nodes and n not in output_nodes]
-    drop_map: Dict[str, float] = {}
-    total = max(1, len(candidates))
+    knocked_graphs = [knockout_node(G, node) for node in candidates]
 
-    for i, node in enumerate(candidates):
-        H = knockout_node(G, node)
+    tasks = [
+        ((H, input_nodes, output_nodes, gamma, kpart_threshold, sim_time), {})
+        for H in knocked_graphs
+    ]
+    mi_values = run_parallel(_mi_from_simulation, tasks, progress_cb=progress_cb,
+                              max_workers=max_workers, label="knockout")
 
-        # Knocking out a node that disconnects input from output collapses
-        # I(X;Y) to zero (full information decay) - no need to simulate.
-        if input_nodes[0] not in H or output_nodes[0] not in H or not nx.has_path(
-            H, input_nodes[0], output_nodes[0]
-        ):
-            drop_map[node] = baseline_mi
-            if progress_cb:
-                progress_cb(int(100 * (i + 1) / total), f"Knockout scan: {node}")
-            continue
+    return {
+        node: float(baseline_mi - (mi if mi is not None else 0.0))
+        for node, mi in zip(candidates, mi_values)
+    }
 
-        sim = KineticsSimulator(H, gamma=gamma, kpart_threshold=kpart_threshold, sim_time=sim_time)
-        result = sim.simulate(input_nodes, output_nodes, llps_enabled=True)
-        mi = compute_information_metrics(result, input_nodes[0], output_nodes[0]).mutual_information
-        drop_map[node] = float(baseline_mi - mi)
 
-        if progress_cb:
-            progress_cb(int(100 * (i + 1) / total), f"Knockout scan: {node}")
-
-    return drop_map
+def _lower_valency(G: nx.Graph, node: str, delta_v: float) -> nx.Graph:
+    H = G.copy()
+    H.nodes[node]["s_llps"] = max(0.0, H.nodes[node].get("s_llps", 0.0) - delta_v)
+    return H
 
 
 def valency_mutagenesis(G: nx.Graph, input_nodes: List[str], output_nodes: List[str],
                           delta_v: float = 0.5, gamma: float = 2.0, kpart_threshold: float = 0.5,
-                          sim_time: float = 50.0, progress_cb: ProgressCB = None) -> Dict[str, float]:
-    """Lower S_LLPS by delta_v (loss-of-disorder mutation) per node, holding k_cat fixed."""
-    baseline_sim = KineticsSimulator(G, gamma=gamma, kpart_threshold=kpart_threshold, sim_time=sim_time)
-    baseline_result = baseline_sim.simulate(input_nodes, output_nodes, llps_enabled=True)
-    baseline_mi = compute_information_metrics(baseline_result, input_nodes[0], output_nodes[0]).mutual_information
+                          sim_time: float = 50.0, progress_cb: ProgressCB = None,
+                          max_workers: Optional[int] = None) -> Dict[str, float]:
+    """Lower S_LLPS by delta_v (loss-of-disorder mutation) per node, holding k_cat fixed.
+
+    Tests whether functional loss on knockdown is spatial (LLPS-mediated)
+    rather than catalytic, since the underlying reaction rate is untouched.
+    """
+    baseline_mi = _mi_from_simulation(G, input_nodes, output_nodes, gamma, kpart_threshold, sim_time)
 
     candidates = [n for n in G.nodes() if G.nodes[n].get("s_llps", 0.0) > kpart_threshold]
-    drop_map: Dict[str, float] = {}
-    total = max(1, len(candidates))
+    mutated_graphs = [_lower_valency(G, node, delta_v) for node in candidates]
 
-    for i, node in enumerate(candidates):
-        H = G.copy()
-        H.nodes[node]["s_llps"] = max(0.0, H.nodes[node].get("s_llps", 0.0) - delta_v)
-        sim = KineticsSimulator(H, gamma=gamma, kpart_threshold=kpart_threshold, sim_time=sim_time)
-        result = sim.simulate(input_nodes, output_nodes, llps_enabled=True)
-        mi = compute_information_metrics(result, input_nodes[0], output_nodes[0]).mutual_information
-        drop_map[node] = float(baseline_mi - mi)
+    tasks = [
+        ((H, input_nodes, output_nodes, gamma, kpart_threshold, sim_time), {})
+        for H in mutated_graphs
+    ]
+    mi_values = run_parallel(_mi_from_simulation, tasks, progress_cb=progress_cb,
+                              max_workers=max_workers, label="valency mutant")
 
-        if progress_cb:
-            progress_cb(int(100 * (i + 1) / total), f"Valency mutagenesis: {node}")
-
-    return drop_map
+    return {
+        node: float(baseline_mi - (mi if mi is not None else 0.0))
+        for node, mi in zip(candidates, mi_values)
+    }
 
 
 def sensitivity_matrix(G: nx.Graph, input_nodes: List[str], output_nodes: List[str],
                          kpart_range: Tuple[float, float] = (0.1, 0.9),
                          gamma_range: Tuple[float, float] = (0.5, 5.0),
                          n_samples: int = 32, sim_time: float = 30.0,
-                         progress_cb: ProgressCB = None) -> Dict[str, np.ndarray]:
-    """Latin Hypercube sample over (K_part threshold, gamma) -> I(X;Y) surface."""
+                         progress_cb: ProgressCB = None, max_workers: Optional[int] = None) -> Dict[str, np.ndarray]:
+    """Latin Hypercube sample over (K_part threshold, gamma) -> I(X;Y) surface, in parallel."""
     sampler = qmc.LatinHypercube(d=2, seed=7)
     sample = sampler.random(n=n_samples)
     scaled = qmc.scale(sample, [kpart_range[0], gamma_range[0]], [kpart_range[1], gamma_range[1]])
 
     thresholds = scaled[:, 0]
     gammas = scaled[:, 1]
-    mi_values = np.zeros(n_samples)
 
-    for i in range(n_samples):
-        sim = KineticsSimulator(G, gamma=float(gammas[i]), kpart_threshold=float(thresholds[i]),
-                                 sim_time=sim_time)
-        result = sim.simulate(input_nodes, output_nodes, llps_enabled=True)
-        mi_values[i] = compute_information_metrics(result, input_nodes[0], output_nodes[0]).mutual_information
-        if progress_cb:
-            progress_cb(int(100 * (i + 1) / n_samples), f"Sensitivity sample {i + 1}/{n_samples}")
+    tasks = [
+        ((G, input_nodes, output_nodes, float(gammas[i]), float(thresholds[i]), sim_time), {})
+        for i in range(n_samples)
+    ]
+    mi_values = run_parallel(_mi_from_simulation, tasks, progress_cb=progress_cb,
+                              max_workers=max_workers, label="sensitivity sample")
+    mi_values = np.array([v if v is not None else 0.0 for v in mi_values])
 
     return {
         "kpart_thresholds": thresholds,

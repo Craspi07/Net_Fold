@@ -105,8 +105,42 @@ def composite_llps_score(disorder: float, kappa: float, valency_info: Dict[str, 
     return float(np.clip(score, 0.0, 1.0))
 
 
-def compute_llps(G: nx.Graph, progress_cb: ProgressCB = None) -> Dict[str, Dict]:
-    """Annotate every node with LLPS feature vector + S_LLPS, in-place on G."""
+def apply_context_modifiers(kappa: float, valency_info: Dict[str, float], ptm_weight: float = 0.0,
+                              multivalency_weight: float = 0.0) -> tuple:
+    """Simulate PTM (e.g. phosphorylation) and multivalent-binding context effects.
+
+    LLPS propensity is not an intrinsic sequence property alone - it is
+    modulated by post-translational state and binding partners. Rather than
+    re-deriving the sequence, these weights perturb the two features PTMs
+    and multivalent scaffolding most directly affect: phosphorylation adds
+    localized charge that sharpens charge-block patterning (kappa), while
+    multivalent binding partners increase effective sticker valency without
+    changing the underlying sequence.
+
+    ptm_weight, multivalency_weight in [0, 1]; 0 = no context effect.
+    Returns (modulated_kappa, modulated_valency_info).
+    """
+    ptm_weight = float(np.clip(ptm_weight, 0.0, 1.0))
+    multivalency_weight = float(np.clip(multivalency_weight, 0.0, 1.0))
+
+    modulated_kappa = float(np.clip(kappa + ptm_weight * 0.4 * (1.0 - kappa), 0.0, 1.0))
+
+    modulated_valency = dict(valency_info)
+    modulated_valency["valency"] = float(
+        np.clip(valency_info["valency"] + multivalency_weight * 0.06, 0.0, 1.0)
+    )
+    return modulated_kappa, modulated_valency
+
+
+def compute_llps(G: nx.Graph, ptm_weight: float = 0.0, multivalency_weight: float = 0.0,
+                  progress_cb: ProgressCB = None) -> Dict[str, Dict]:
+    """Annotate every node with LLPS feature vector + S_LLPS, in-place on G.
+
+    ``s_llps_base`` is the sequence-intrinsic score; ``s_llps`` is the
+    context-modulated score actually used downstream (Layers 3-5), keeping
+    both visible acknowledges that LLPS propensity is context-dependent
+    rather than a fixed sequence property.
+    """
     results: Dict[str, Dict] = {}
     nodes = list(G.nodes())
     total = max(1, len(nodes))
@@ -125,7 +159,12 @@ def compute_llps(G: nx.Graph, progress_cb: ProgressCB = None) -> Dict[str, Dict]
 
         kappa = charge_segregation_kappa(seq)
         valency_info = sticker_valency(seq)
-        s_llps = composite_llps_score(disorder, kappa, valency_info)
+        s_llps_base = composite_llps_score(disorder, kappa, valency_info)
+
+        mod_kappa, mod_valency_info = apply_context_modifiers(
+            kappa, valency_info, ptm_weight=ptm_weight, multivalency_weight=multivalency_weight
+        )
+        s_llps = composite_llps_score(disorder, mod_kappa, mod_valency_info)
 
         feature = {
             "disorder_score": disorder,
@@ -133,7 +172,10 @@ def compute_llps(G: nx.Graph, progress_cb: ProgressCB = None) -> Dict[str, Dict]
             "valency": valency_info["valency"],
             "aromatic_frac": valency_info["aromatic_frac"],
             "charged_frac": valency_info["charged_frac"],
+            "s_llps_base": s_llps_base,
             "s_llps": s_llps,
+            "ptm_weight": ptm_weight,
+            "multivalency_weight": multivalency_weight,
         }
         results[n] = feature
         G.nodes[n].update(feature)

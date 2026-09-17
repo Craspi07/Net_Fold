@@ -17,20 +17,21 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from core import layer1_topology, layer2_llps, layer4_infotheory, layer5_mutagenesis
-from core.layer3_kinetics import KineticsSimulator
+from core import layer1_topology, layer2_llps, layer4_infotheory, layer5_mutagenesis, pathways
 from core.network_builder import NetworkBuilder
 from ui.graph_view import GraphView
 from ui.plot_widgets import HeatmapWidget, KineticsPlotWidget, MutualInfoPlotWidget, NoiseComparisonPlotWidget
-from utils.worker import AsyncWorker, FunctionWorker
+from utils.parallel_worker import AsyncWorker, FunctionWorker
 
 log = logging.getLogger("phasenet.main_window")
+
+CUSTOM_PATHWAY_LABEL = "Custom (from input above)"
 
 NODE_COLUMNS = [
     ("id", "ID"), ("label", "Label"), ("role", "Role"),
     ("degree_centrality", "Degree Cent."), ("betweenness_centrality", "Betweenness"),
     ("pagerank", "PageRank"), ("eigenvector_centrality", "Eigenvector"),
-    ("vulnerability", "Vulnerability"), ("s_llps", "S_LLPS"),
+    ("vulnerability", "Vulnerability"), ("s_llps", "S_LLPS"), ("s_llps_base", "S_LLPS (base)"),
     ("disorder_score", "Disorder"), ("kappa", "Kappa"), ("valency", "Valency"),
     ("ps_critical_hub", "PS Critical Hub"),
 ]
@@ -120,6 +121,7 @@ class MainWindow(QMainWindow):
         self.last_sim_comparison: Optional[dict] = None
         self._fetch_worker: Optional[AsyncWorker] = None
         self._pipeline_worker: Optional[FunctionWorker] = None
+        self._pending_pathway: Optional[pathways.PathwayTemplate] = None
 
         self._build_ui()
         self._wire_logging()
@@ -152,9 +154,17 @@ class MainWindow(QMainWindow):
 
         input_group = QGroupBox("Protein Input")
         input_layout = QVBoxLayout(input_group)
+
+        input_layout.addWidget(QLabel("Pre-curated pathway:"))
+        self.pathway_combo = QComboBox()
+        self.pathway_combo.addItem(CUSTOM_PATHWAY_LABEL)
+        self.pathway_combo.addItems(pathways.get_pathway_names())
+        self.pathway_combo.currentTextChanged.connect(self._on_pathway_selected)
+        input_layout.addWidget(self.pathway_combo)
+
         self.id_input = QTextEdit()
         self.id_input.setPlaceholderText("UniProt IDs or gene symbols, one per line\n(e.g. FUS, TDP-43, EWSR1)")
-        self.id_input.setFixedHeight(100)
+        self.id_input.setFixedHeight(90)
         input_layout.addWidget(self.id_input)
         load_btn = QPushButton("Load from File (.csv/.txt)")
         load_btn.clicked.connect(self._load_file)
@@ -185,6 +195,34 @@ class MainWindow(QMainWindow):
         discovery_layout.addWidget(self.depth_spin)
 
         layout.addWidget(discovery_group)
+
+        context_group = QGroupBox("LLPS Context Modifiers")
+        context_layout = QVBoxLayout(context_group)
+
+        self.ptm_checkbox_label = QLabel("PTM (phosphorylation) weight:")
+        context_layout.addWidget(self.ptm_checkbox_label)
+        self.ptm_weight_spin = QDoubleSpinBox()
+        self.ptm_weight_spin.setRange(0.0, 1.0)
+        self.ptm_weight_spin.setSingleStep(0.05)
+        self.ptm_weight_spin.setValue(0.0)
+        self.ptm_weight_spin.setToolTip(
+            "Simulates phosphorylation-driven charge patterning that context-modulates S_LLPS "
+            "without changing the underlying sequence."
+        )
+        context_layout.addWidget(self.ptm_weight_spin)
+
+        context_layout.addWidget(QLabel("Multivalency (binding partner) weight:"))
+        self.multivalency_weight_spin = QDoubleSpinBox()
+        self.multivalency_weight_spin.setRange(0.0, 1.0)
+        self.multivalency_weight_spin.setSingleStep(0.05)
+        self.multivalency_weight_spin.setValue(0.0)
+        self.multivalency_weight_spin.setToolTip(
+            "Simulates multivalent scaffold/binding-partner effects that raise effective sticker "
+            "valency beyond what the sequence alone predicts."
+        )
+        context_layout.addWidget(self.multivalency_weight_spin)
+
+        layout.addWidget(context_group)
 
         sim_group = QGroupBox("Simulation Hyperparameters")
         sim_layout = QVBoxLayout(sim_group)
@@ -345,6 +383,28 @@ class MainWindow(QMainWindow):
         self.log_console.appendHtml(f'<span style="color:{color}">{text}</span>')
 
     # ------------------------------------------------------------ Actions
+    def _on_pathway_selected(self, name: str) -> None:
+        if name == CUSTOM_PATHWAY_LABEL:
+            self._pending_pathway = None
+            return
+        template = pathways.get_pathway(name)
+        self._pending_pathway = template
+
+        self.id_input.setPlainText("\n".join(template.seed_ids))
+        self.score_spin.setValue(template.min_score)
+        self.depth_spin.setValue(template.expand_depth)
+        self.gamma_spin.setValue(template.gamma)
+        self.kpart_spin.setValue(template.kpart_threshold)
+        self.ptm_weight_spin.setValue(template.ptm_weight)
+        self.multivalency_weight_spin.setValue(template.multivalency_weight)
+        organism_idx = self.organism_combo.findData(template.organism)
+        if organism_idx >= 0:
+            self.organism_combo.setCurrentIndex(organism_idx)
+
+        log.info("Loaded pathway template '%s': %s", template.name, template.description)
+        if template.notes:
+            log.info("Pathway note: %s", template.notes)
+
     def _load_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Load Protein IDs", "", "Text/CSV Files (*.csv *.txt)")
         if not path:
@@ -410,6 +470,15 @@ class MainWindow(QMainWindow):
         if len(node_ids) > 1:
             self.output_node_combo.setCurrentIndex(1)
 
+        if self._pending_pathway is not None:
+            template = self._pending_pathway
+            in_idx = self.input_node_combo.findText(template.suggested_input)
+            out_idx = self.output_node_combo.findText(template.suggested_output)
+            if in_idx >= 0:
+                self.input_node_combo.setCurrentIndex(in_idx)
+            if out_idx >= 0:
+                self.output_node_combo.setCurrentIndex(out_idx)
+
         self.graph_view.update_graph(graph)
         self._refresh_table()
 
@@ -438,21 +507,28 @@ class MainWindow(QMainWindow):
             return lambda pct, msg="": progress_cb(base + int(pct * span / 100), msg) if progress_cb else None
 
         layer1_topology.compute_topology(G, progress_cb=scaled(0, 30))
-        layer2_llps.compute_llps(G, progress_cb=scaled(30, 20))
+        layer2_llps.compute_llps(
+            G, ptm_weight=self.ptm_weight_spin.value(), multivalency_weight=self.multivalency_weight_spin.value(),
+            progress_cb=scaled(30, 15),
+        )
         critical_hubs = layer2_llps.identify_critical_hubs(G)
 
         input_nodes = [self.input_node_combo.currentText()] if self.input_node_combo.currentText() else [list(G.nodes())[0]]
         output_nodes = [self.output_node_combo.currentText()] if self.output_node_combo.currentText() else [list(G.nodes())[-1]]
 
-        simulator = KineticsSimulator(
-            G, gamma=self.gamma_spin.value(), kpart_threshold=self.kpart_spin.value(),
+        kinetics_kwargs = dict(
+            gamma=self.gamma_spin.value(), kpart_threshold=self.kpart_spin.value(),
             sim_time=self.time_spin.value(), noise_amplitude=self.noise_spin.value(),
         )
-        comparison = layer4_infotheory.compare_llps_effect(simulator, input_nodes, output_nodes, signal_kind="step")
-        if progress_cb:
-            progress_cb(70, "Sweeping noise levels for MI curve...")
+        comparison = layer4_infotheory.compare_llps_effect(
+            G, input_nodes, output_nodes, signal_kind="step", progress_cb=scaled(45, 25), **kinetics_kwargs,
+        )
         noise_levels = np.linspace(0.0, 1.5, 10)
-        mi_curve = layer4_infotheory.mi_vs_noise_curve(simulator, input_nodes, output_nodes, noise_levels)
+        mi_curve = layer4_infotheory.mi_vs_noise_curve(
+            G, input_nodes, output_nodes, noise_levels, progress_cb=scaled(70, 30),
+            gamma=kinetics_kwargs["gamma"], kpart_threshold=kinetics_kwargs["kpart_threshold"],
+            sim_time=kinetics_kwargs["sim_time"],
+        )
 
         if progress_cb:
             progress_cb(100, "Pipeline complete.")
