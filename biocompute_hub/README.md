@@ -21,6 +21,10 @@ with `analysis/info_thermodynamics.py`: a Kraskov-Stogbauer-Grassberger
 information and transfer entropy, with a histogram-based fallback
 (`sklearn.metrics.mutual_info_score`) for small or degenerate samples.
 
+For the full derivation of every equation (the Langevin SDE, the LJ
+potential, the Cahn-Hilliard/reaction-diffusion PDEs, the KSG and transfer
+entropy estimators), see **[THEORY.md](THEORY.md)**.
+
 ## Install
 
 A virtual environment is recommended: this project's dependencies (notably

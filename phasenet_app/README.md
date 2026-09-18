@@ -7,6 +7,10 @@ analysis across a 5-layer computational pipeline. Three pre-curated
 pathways (NF-κB/NEMO, Ras/MAPK, Stress Granules) give immediate,
 pre-parameterized benchmarks without building an arbitrary network first.
 
+For the full derivation of every formula each layer computes (centrality,
+$S_{LLPS}$, the condensate kinetics, mutual information, the Layer 5
+scans), see **[THEORY.md](THEORY.md)**.
+
 ## Install
 
 A virtual environment is recommended: this app's PyQt6/PyQt6-WebEngine +
