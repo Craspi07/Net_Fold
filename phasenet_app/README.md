@@ -7,17 +7,45 @@ analysis across a 5-layer computational pipeline. Three pre-curated
 pathways (NF-κB/NEMO, Ras/MAPK, Stress Granules) give immediate,
 pre-parameterized benchmarks without building an arbitrary network first.
 
+For the full derivation of every formula each layer computes (centrality,
+$S_{LLPS}$, the condensate kinetics, mutual information, the Layer 5
+scans), see **[THEORY.md](THEORY.md)**.
+
 ## Install
 
+A virtual environment is recommended: this app's PyQt6/PyQt6-WebEngine +
+numba dependencies are heavy and best kept isolated from your system
+Python and from other projects (`biocompute_hub` in this repo pulls in a
+different, non-overlapping dependency set via FiPy).
+
 ```bash
+cd phasenet_app
+
+# 1. create the venv
+python3 -m venv .venv
+
+# 2. activate it
+source .venv/bin/activate        # macOS/Linux
+# .venv\Scripts\activate         # Windows (cmd)
+# .venv\Scripts\Activate.ps1     # Windows (PowerShell)
+
+# 3. install dependencies
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
+
+On Linux, PyQt6-WebEngine may also need a few system libraries that pip
+can't install (`libegl1`, `libgl1`, `libxkbcommon0`, `libxcb-cursor0`) -
+install these via your OS package manager if importing `QtWebEngineWidgets`
+fails.
 
 ## Run
 
 ```bash
 python main.py
 ```
+
+Deactivate the environment anytime with `deactivate`.
 
 ## Pipeline
 
