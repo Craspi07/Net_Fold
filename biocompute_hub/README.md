@@ -23,7 +23,24 @@ information and transfer entropy, with a histogram-based fallback
 
 ## Install
 
+A virtual environment is recommended: this project's dependencies (notably
+`fipy`) are heavy and best kept isolated from your system Python and from
+other projects (`phasenet_app` in this repo pulls in a different,
+non-overlapping dependency set via PyQt6).
+
 ```bash
+cd biocompute_hub
+
+# 1. create the venv
+python3 -m venv .venv
+
+# 2. activate it
+source .venv/bin/activate        # macOS/Linux
+# .venv\Scripts\activate         # Windows (cmd)
+# .venv\Scripts\Activate.ps1     # Windows (PowerShell)
+
+# 3. install dependencies
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
@@ -33,6 +50,8 @@ pip install -r requirements.txt
 python main.py --mode micro    # agent-based Langevin dynamics
 python main.py --mode meso     # Cahn-Hilliard phase-field PDE
 ```
+
+Deactivate the environment anytime with `deactivate`.
 
 Both save a three-panel dashboard to `output.png` (override with
 `--output`): final spatial state, input/output signal time series, and the
